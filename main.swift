@@ -286,6 +286,7 @@ final class VolumeHUD {
     private static func backdrop(for content: NSView) -> NSView {
         #if compiler(>=6.2)
         if #available(macOS 26, *) {
+            if let glass = lightGlass(for: content) { return glass }
             let glass = NSGlassEffectView()
             glass.style = .clear
             glass.cornerRadius = 22
@@ -301,6 +302,48 @@ final class VolumeHUD {
         effect.addSubview(content)
         return effect
     }
+
+    #if compiler(>=6.2)
+    // The system's own panel, drawn by MenuBarAgent, blurs what is behind it
+    // by about 3 pt; the public glass blurs by about 10 and hides it. Private
+    // Core Animation pieces come as close as it gets: a backdrop layer with a
+    // light gaussian blur under a darkening, and on top glass variant 13,
+    // which only bends the light at the edge. Every piece is looked up first;
+    // if one is missing, nil, and the public glass is used.
+    @available(macOS 26, *)
+    private static func lightGlass(for content: NSView) -> NSView? {
+        let filterWithType = NSSelectorFromString("filterWithType:"), inputKeys = NSSelectorFromString("inputKeys")
+        guard let backdropType = NSClassFromString("CABackdropLayer") as? CALayer.Type,
+              backdropType.instancesRespond(to: NSSelectorFromString("setWindowServerAware:")),
+              let filterType = NSClassFromString("CAFilter") as AnyObject?, filterType.responds(to: filterWithType),
+              let blur = filterType.perform(filterWithType, with: "gaussianBlur" as NSString)?.takeUnretainedValue() as? NSObject,
+              blur.responds(to: inputKeys),
+              (blur.perform(inputKeys)?.takeUnretainedValue() as? [String])?.contains("inputRadius") == true,
+              NSGlassEffectView.instancesRespond(to: NSSelectorFromString("set_variant:"))
+        else { return nil }
+        blur.setValue(3, forKey: "inputRadius")
+        let backdrop = backdropType.init()
+        backdrop.setValue(true, forKey: "windowServerAware")
+        backdrop.filters = [blur]
+        let darkening = CALayer()
+        darkening.backgroundColor = NSColor.black.withAlphaComponent(0.2).cgColor
+
+        let view = NSView(frame: content.frame)
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 22
+        view.layer?.cornerCurve = .continuous
+        view.layer?.masksToBounds = true
+        for layer in [backdrop, darkening] {
+            layer.frame = view.bounds
+            view.layer?.addSublayer(layer)
+        }
+        let edge = NSGlassEffectView(frame: view.bounds)
+        edge.cornerRadius = 22
+        edge.setValue(13, forKey: "_variant")
+        [edge, content].forEach(view.addSubview)
+        return view
+    }
+    #endif
 
     private static func speaker(_ symbol: String) -> NSImageView {
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
