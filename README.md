@@ -23,7 +23,10 @@ path: no virtual device, no software gain, no extra latency.
 - **Mute** turns the monitor mute on and off. Like in macOS, any volume key turns mute
   off.
 - **Option+volume key** still opens Sound settings.
-- A small panel in the top right corner shows the level in dB for a second and a half.
+- For a second and a half a panel like the system volume indicator shows the level: it
+  drops out of the menu bar under the Control Center icon, Liquid Glass, with the device
+  name over a bar with a tick every 6 dB. Muted, the bar is empty. Apart from the device
+  name it has no text, so it reads the same in any language.
 - It only acts while an Audient device is the default output. For the built-in speakers,
   AirPods and everything else, the keys reach macOS untouched.
 - If the interface can't be reached, the key goes through to macOS as usual.
@@ -47,14 +50,23 @@ change it reads the current level from the device, which is how the keys keep up
 the knob.
 
 The keys are caught with a `CGEvent` tap on system-defined events, which needs the
-Accessibility permission.
+Accessibility permission. The same permission lets the panel find the icon in the menu
+bar to hang under; without one, it sits in the top right corner.
 
-All of it is one file, [main.swift](main.swift), about 370 lines.
+The system's panel blurs what's behind it by about 3 pt, while the public Liquid Glass
+(`NSGlassEffectView`) blurs by about 10 and hides it. So the panel is put together from
+private Core Animation pieces: a `CABackdropLayer` with a light `gaussianBlur` filter
+under a darkening, and glass variant 13, which only bends the light at the edge. Each one
+is looked up before use. If a macOS update removes any of them, the panel falls back to
+the public clear glass.
+
+All of it is one file, [main.swift](main.swift), about 560 lines.
 
 ## Requirements
 
 - macOS 13 or later.
-- Xcode or the Command Line Tools, for `swiftc`.
+- Xcode or the Command Line Tools, for `swiftc`. The glass panel needs macOS 26 and
+  Xcode 26; otherwise the panel is the older blurred kind.
 - Tested only with an iD14 MkII on macOS 27. The other iD models may use the same
   protocol, but they haven't been tried.
 
@@ -96,9 +108,11 @@ System Settings until you delete it there.
 - Turning the knob doesn't show the panel. That would need constant polling of the
   device, and the BiD authors warn that frequent requests can hang the iD's control
   interface.
-- The panel is iDVolume's own, not the system volume indicator. On recent macOS only
-  Apple's own processes can show that one.
-- The panel's "muted" label is in Russian ("выкл").
+- The panel is iDVolume's own copy of the system volume indicator, not the indicator
+  itself. On recent macOS only Apple's own processes can show that one.
+- The panel's light blur relies on private macOS classes. iDVolume checks that they exist,
+  but not that they still behave the same, so a macOS update could change the look until
+  the code is updated.
 
 ## License
 
