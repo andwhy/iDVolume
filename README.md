@@ -96,3 +96,7 @@ System Settings until you delete it there.
 - The panel is iDVolume's own, not the system volume indicator. On recent macOS only
   Apple's own processes can show that one.
 - The panel's "muted" label is in Russian ("выкл").
+
+## License
+
+MIT, see [LICENSE](LICENSE).
