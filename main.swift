@@ -24,6 +24,12 @@ enum Audient {
     static let maxDB = 0.0
     static let stepDB = 2.0
     static let fineStepDB = 0.5
+    // presses closer than quickPress seconds apart add stepGrowthDB each;
+    // a held key steps at most once per holdInterval, as if pressed that fast
+    static let quickPress = 0.35
+    static let holdInterval = 0.15
+    static let stepGrowthDB = 1.0
+    static let maxStepDB = 5.0
 }
 
 struct MonitorState {
@@ -271,6 +277,26 @@ let soundUpKey = 0, soundDownKey = 1, muteKey = 7
 final class VolumeKeys {
     private let control = MonitorControl()
     private let hud = VolumeHUD()
+    private var lastStep: (key: Int, time: Date, size: Double)?
+
+    // Quick presses in one direction grow the step, the way the front knob
+    // speeds up when turned fast, and holding the key counts as pressing it
+    // quickly. The system repeats a held key far more often than anyone can
+    // press, so repeats closer than holdInterval are dropped (nil); that also
+    // spares the iD's control interface a flood of requests.
+    private func step(for key: Int, fine: Bool, isRepeat: Bool) -> Double? {
+        let now = Date()
+        var size = fine ? Audient.fineStepDB : Audient.stepDB
+        if let lastStep, lastStep.key == key {
+            let since = now.timeIntervalSince(lastStep.time)
+            if isRepeat && since < Audient.holdInterval { return nil }
+            if !fine && (isRepeat || since < Audient.quickPress) {
+                size = min(lastStep.size + Audient.stepGrowthDB, Audient.maxStepDB)
+            }
+        }
+        lastStep = (key, now, size)
+        return size
+    }
 
     // true when the event is ours and must not reach macOS
     func handle(_ event: CGEvent) -> Bool {
@@ -278,6 +304,7 @@ final class VolumeKeys {
               let nsEvent = NSEvent(cgEvent: event), nsEvent.subtype.rawValue == 8 else { return false }
         let key = (nsEvent.data1 & 0xFFFF_0000) >> 16
         let isDown = (nsEvent.data1 & 0xFF00) >> 8 == 0x0A
+        let isRepeat = nsEvent.data1 & 0x1 != 0
         guard key == soundUpKey || key == soundDownKey || key == muteKey else { return false }
 
         let flags = event.flags
@@ -287,11 +314,12 @@ final class VolumeKeys {
         guard let device = audientDefaultOutput() else { return false }
         guard isDown else { return true }
 
-        let step = fine ? Audient.fineStepDB : Audient.stepDB
         let state: MonitorState?
         switch key {
-        case soundUpKey: state = control.adjust(by: step)
-        case soundDownKey: state = control.adjust(by: -step)
+        case soundUpKey, soundDownKey:
+            // a held key between two steps: nothing to change, still ours
+            guard let step = step(for: key, fine: fine, isRepeat: isRepeat) else { return true }
+            state = control.adjust(by: key == soundUpKey ? step : -step)
         default: state = control.toggleMute()
         }
         // could not reach the device: let macOS answer as it always did

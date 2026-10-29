@@ -17,6 +17,9 @@ path: no virtual device, no software gain, no extra latency.
 
 - **Volume Up / Down** change the monitor level by 2 dB per press, **Shift+Option+key**
   by 0.5 dB.
+- Quick presses speed up, like the knob turned fast: each press that follows the last one
+  within 0.35 s goes 1 dB further, up to 5 dB per press. Holding a key does the same,
+  one step at most every 0.15 s. The fine step never speeds up.
 - **Mute** turns the monitor mute on and off. Like in macOS, any volume key turns mute
   off.
 - **Option+volume key** still opens Sound settings.
@@ -46,7 +49,7 @@ the knob.
 The keys are caught with a `CGEvent` tap on system-defined events, which needs the
 Accessibility permission.
 
-All of it is one file, [main.swift](main.swift), about 340 lines.
+All of it is one file, [main.swift](main.swift), about 370 lines.
 
 ## Requirements
 
