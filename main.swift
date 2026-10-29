@@ -159,59 +159,156 @@ func audientDefaultOutput() -> String? {
 }
 
 // MARK: - HUD
+//
+// A copy of the volume indicator of macOS 26 and later: a Liquid Glass panel
+// that drops out of the menu bar under its icon there, with the device name
+// over a bar that has a speaker at each end and a tick every 6 dB, 16 steps
+// like the system's. Muted, the bar is simply empty. The device's own name is
+// the only text, so there is nothing to translate.
+
+func axValue<T>(_ element: AXUIElement, _ attribute: String) -> T? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+    return value as? T
+}
+
+// The menu bar item the indicator hangs from, found through Accessibility,
+// which the key tap needs anyway: a Sound item if the menu bar shows one,
+// else Control Center's, which on macOS 27 turns into a speaker while the
+// volume changes. Since macOS 27 they belong to MenuBarAgent.
+func volumeMenuExtraFrame() -> NSRect? {
+    let ids = ["com.apple.menuextra.sound", "com.apple.menuextra.controlcenter"]
+    var found: [String: CGRect] = [:]
+    func visit(_ element: AXUIElement, depth: Int) {
+        if let id: String = axValue(element, kAXIdentifierAttribute), ids.contains(id), found[id] == nil,
+           let value: AXValue = axValue(element, "AXFrame") {
+            var frame = CGRect.zero
+            if AXValueGetValue(value, .cgRect, &frame) { found[id] = frame }
+        }
+        guard depth < 2, let children: [AXUIElement] = axValue(element, kAXChildrenAttribute) else { return }
+        children.forEach { visit($0, depth: depth + 1) }
+    }
+    for bundle in ["com.apple.MenuBarAgent", "com.apple.controlcenter"] {
+        guard let pid = NSRunningApplication.runningApplications(withBundleIdentifier: bundle).first?.processIdentifier,
+              let bar: AXUIElement = axValue(AXUIElementCreateApplication(pid), kAXExtrasMenuBarAttribute) else { continue }
+        visit(bar, depth: 0)
+    }
+    // Accessibility counts from the top left of the main display, AppKit from its bottom left
+    guard let frame = ids.lazy.compactMap({ found[$0] }).first, let main = NSScreen.screens.first else { return nil }
+    return NSRect(x: frame.minX, y: main.frame.maxY - frame.maxY, width: frame.width, height: frame.height)
+}
 
 final class LevelBar: NSView {
-    var fraction = 0.0 { didSet { needsDisplay = true } }
+    static let steps = 16
+    private let inset: CGFloat = 5  // from the ends of the bar to the ends of the scale
+    private let track = CALayer()
+    private let fill = CALayer()
 
-    override func draw(_ dirtyRect: NSRect) {
-        let radius = bounds.height / 2
-        NSColor.labelColor.withAlphaComponent(0.18).setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius).fill()
-        guard fraction > 0 else { return }
-        var filled = bounds
-        filled.size.width = max(bounds.height, bounds.width * fraction)
-        NSColor.labelColor.setFill()
-        NSBezierPath(roundedRect: filled, xRadius: radius, yRadius: radius).fill()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        let line = CGRect(x: 0, y: bounds.height - 4, width: bounds.width, height: 4)
+        for (part, alpha) in [(track, 0.4), (fill, 1.0)] {
+            part.frame = line
+            part.cornerRadius = line.height / 2
+            part.backgroundColor = NSColor.white.withAlphaComponent(alpha).cgColor
+            layer?.addSublayer(part)
+        }
+        for step in 0...Self.steps {
+            let tick = CALayer()
+            let x = inset + (line.width - 2 * inset) * CGFloat(step) / CGFloat(Self.steps)
+            tick.frame = CGRect(x: x - 0.75, y: 0, width: 1.5, height: 2.5)
+            tick.cornerRadius = 0.75
+            tick.backgroundColor = NSColor.white.withAlphaComponent(0.55).cgColor
+            layer?.addSublayer(tick)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // Like the system's, the fill ends right over the tick of its level.
+    func set(_ fraction: Double, animated: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(!animated)
+        CATransaction.setAnimationDuration(0.15)
+        fill.frame.size.width = fraction > 0 ? inset + (track.frame.width - 2 * inset) * fraction : 0
+        CATransaction.commit()
     }
 }
 
 final class VolumeHUD {
-    private let size = NSSize(width: 300, height: 64)
+    private let size = NSSize(width: 292, height: 62)
+    private let gap: CGFloat = 11   // to the menu bar and the screen edge
+    private let room: CGFloat = 24  // around the panel, for the fall and the spring
     private let panel: NSPanel
-    private let icon = NSImageView()
+    private let mover = NSView()
     private let title = NSTextField(labelWithString: "")
-    private let value = NSTextField(labelWithString: "")
-    private let bar = LevelBar()
+    private let bar = LevelBar(frame: NSRect(x: 31, y: 14, width: 222, height: 10))
+    private var shown = false
     private var generation = 0
 
     init() {
-        panel = NSPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel],
-                        backing: .buffered, defer: true)
+        // a hung menu bar must not hold up the key tap
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.2)
+        let frame = NSRect(origin: .zero, size: size).insetBy(dx: -room, dy: -room)
+        panel = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.ignoresMouseEvents = true
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        // dark like the system's in either mode, so the white reads on any background
+        panel.appearance = NSAppearance(named: .darkAqua)
 
-        let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        let content = NSView(frame: NSRect(origin: .zero, size: size))
+        title.frame = NSRect(x: 15, y: 36, width: size.width - 30, height: 16)
+        title.font = .systemFont(ofSize: 12, weight: .medium)
+        title.textColor = .white
+        title.lineBreakMode = .byTruncatingTail
+        let quiet = Self.speaker("speaker.fill"), loud = Self.speaker("speaker.wave.3.fill")
+        quiet.setFrameOrigin(NSPoint(x: 14, y: 22 - quiet.frame.height / 2))
+        loud.setFrameOrigin(NSPoint(x: size.width - 14 - loud.frame.width, y: 22 - loud.frame.height / 2))
+        [title, quiet, bar, loud].forEach(content.addSubview)
+
+        let card = Self.backdrop(for: content)
+        card.frame = content.frame
+        mover.frame = NSRect(origin: NSPoint(x: room, y: room), size: size)
+        mover.wantsLayer = true
+        mover.addSubview(card)
+        let root = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        root.addSubview(mover)
+        panel.contentView = root
+    }
+
+    // Clear Liquid Glass like the system's; the blurred HUD of old where the
+    // system or the SDK (before Xcode 26) has no glass.
+    private static func backdrop(for content: NSView) -> NSView {
+        #if compiler(>=6.2)
+        if #available(macOS 26, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .clear
+            glass.cornerRadius = 22
+            glass.contentView = content
+            return glass
+        }
+        #endif
+        let effect = NSVisualEffectView()
         effect.material = .hudWindow
         effect.blendingMode = .behindWindow
         effect.state = .active
-        effect.maskImage = Self.roundedMask(radius: 18)
-        panel.contentView = effect
+        effect.maskImage = roundedMask(radius: 22)
+        effect.addSubview(content)
+        return effect
+    }
 
-        icon.frame = NSRect(x: 16, y: 20, width: 24, height: 24)
-        icon.contentTintColor = .labelColor
-        title.frame = NSRect(x: 52, y: 34, width: 232, height: 16)
-        title.font = .systemFont(ofSize: 12, weight: .semibold)
-        title.textColor = .secondaryLabelColor
-        bar.frame = NSRect(x: 52, y: 19, width: 172, height: 6)
-        value.frame = NSRect(x: 228, y: 14, width: 58, height: 16)
-        value.alignment = .right
-        value.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        value.textColor = .labelColor
-        [icon, title, bar, value].forEach(effect.addSubview)
+    private static func speaker(_ symbol: String) -> NSImageView {
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .medium)) ?? NSImage()
+        let view = NSImageView(image: image)
+        view.contentTintColor = .white
+        view.frame.size = image.size
+        return view
     }
 
     private static func roundedMask(radius: CGFloat) -> NSImage {
@@ -226,44 +323,90 @@ final class VolumeHUD {
         return image
     }
 
-    func show(_ state: MonitorState, device: String) {
-        let silent = state.muted || state.db == nil
-        let symbol: String
-        switch state.fraction {
-        case _ where silent: symbol = "speaker.slash.fill"
-        case ..<0.34: symbol = "speaker.wave.1.fill"
-        case ..<0.67: symbol = "speaker.wave.2.fill"
-        default: symbol = "speaker.wave.3.fill"
-        }
-        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 18, weight: .medium))
-        title.stringValue = device
-        bar.fraction = state.fraction
-        if state.muted {
-            value.stringValue = "выкл"
-        } else if let db = state.db {
-            value.stringValue = String(format: db == db.rounded() ? "%.0f dB" : "%.1f dB", db)
-                .replacingOccurrences(of: "-", with: "−")
+    // Where the system's hangs: centred under its menu bar item, or in the
+    // top right corner when the menu bar doesn't show one.
+    private func placement() -> NSRect? {
+        let origin: NSPoint
+        if let item = volumeMenuExtraFrame(),
+           let screen = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: item.midX, y: item.midY)) }) {
+            let x = min(max(item.midX - size.width / 2, screen.frame.minX + gap), screen.frame.maxX - gap - size.width)
+            origin = NSPoint(x: x, y: screen.visibleFrame.maxY - gap - size.height)
+        } else if let screen = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame {
+            origin = NSPoint(x: screen.maxX - gap - size.width, y: screen.maxY - gap - size.height)
         } else {
-            value.stringValue = "−∞ dB"
+            return nil
         }
+        return NSRect(origin: origin, size: size).insetBy(dx: -room, dy: -room)
+    }
 
-        if let screen = NSScreen.main ?? NSScreen.screens.first {
-            let frame = screen.visibleFrame
-            panel.setFrameOrigin(NSPoint(x: frame.maxX - size.width - 14, y: frame.maxY - size.height - 14))
+    // Up in the menu bar and a little smaller, scaled about the top edge, so
+    // that the panel seems to drop out of it.
+    private var tucked: CATransform3D {
+        let anchor = mover.layer?.anchorPoint ?? .zero
+        let top = CGPoint(x: (0.5 - anchor.x) * size.width, y: (1 - anchor.y) * size.height)
+        let raised = CATransform3DMakeTranslation(top.x, top.y + 20, 0)
+        return CATransform3DTranslate(CATransform3DScale(raised, 0.8, 0.8, 1), -top.x, -top.y, 0)
+    }
+
+    private func appear() {
+        guard let layer = mover.layer else { return }
+        // from wherever a leaving panel has got to
+        let current = panel.isVisible ? layer.presentation() : nil
+        let fall = CASpringAnimation(keyPath: "transform")
+        fall.fromValue = NSValue(caTransform3D: current?.transform ?? tucked)
+        fall.stiffness = 280
+        fall.damping = 22
+        fall.duration = fall.settlingDuration
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = current?.opacity ?? 0
+        fade.duration = 0.15
+        layer.transform = CATransform3DIdentity
+        layer.opacity = 1
+        layer.add(fall, forKey: "transform")
+        layer.add(fade, forKey: "opacity")
+        shown = true
+        panel.orderFrontRegardless()
+    }
+
+    private func disappear(_ last: Int) {
+        guard let layer = mover.layer else { return }
+        shown = false
+        let current = layer.presentation()
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in
+            guard let self, self.generation == last else { return }
+            self.panel.orderOut(nil)
+        }
+        let rise = CABasicAnimation(keyPath: "transform")
+        rise.fromValue = NSValue(caTransform3D: current?.transform ?? CATransform3DIdentity)
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = current?.opacity ?? 1
+        for animation in [rise, fade] {
+            animation.duration = 0.25
+            animation.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        }
+        layer.transform = tucked
+        layer.opacity = 0
+        layer.add(rise, forKey: "transform")
+        layer.add(fade, forKey: "opacity")
+        CATransaction.commit()
+    }
+
+    func show(_ state: MonitorState, device: String) {
+        title.stringValue = device
+        bar.set(state.fraction, animated: shown)
+        if !shown {
+            if !panel.isVisible {
+                guard let frame = placement() else { return }
+                panel.setFrame(frame, display: false)
+            }
+            appear()
         }
         generation += 1
-        let shown = generation
-        panel.alphaValue = 1
-        panel.orderFrontRegardless()
+        let last = generation
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self, self.generation == shown else { return }
-            NSAnimationContext.runAnimationGroup({ context in
-                context.duration = 0.3
-                self.panel.animator().alphaValue = 0
-            }, completionHandler: {
-                if self.generation == shown { self.panel.orderOut(nil) }
-            })
+            guard let self, self.generation == last else { return }
+            self.disappear(last)
         }
     }
 }
